@@ -43,7 +43,7 @@ export type Candidato = {
   match_plato: number | null; platos_match: string[] | null; verificado_en: string | null;
 };
 
-export type Etiqueta = "segura" | "audaz" | "sorpresa";
+export type Etiqueta = "segura" | "audaz" | "sorpresa" | "alternativa";
 
 export type Elegido = {
   c: Candidato;
@@ -245,7 +245,13 @@ export function rankear(
   const cocinasUsadas = new Set(elegidos.flatMap((e) => e.p.c.cocinas));
   const resto = top.filter((x) => !usados.has(x.c.id));
   const sorpresa = resto.find((x) => !x.c.cocinas.some((k) => cocinasUsadas.has(k))) ?? resto[0];
-  if (sorpresa) elegidos.push({ p: sorpresa, etiqueta: "sorpresa" });
+  if (sorpresa) { elegidos.push({ p: sorpresa, etiqueta: "sorpresa" }); usados.add(sorpresa.c.id); }
+
+  // 4) Si faltan opciones (ej: no hubo una "audaz" que cumpla el umbral), completar con las mejores restantes
+  for (const x of top) {
+    if (elegidos.length >= 3) break;
+    if (!usados.has(x.c.id)) { elegidos.push({ p: x, etiqueta: "alternativa" }); usados.add(x.c.id); }
+  }
 
   return elegidos.map(({ p, etiqueta }) => ({
     c: p.c,

@@ -11,6 +11,7 @@ import {
   type Candidato, type Elegido, type Filtros, type PerfilPersona,
   fmtDistancia, precioTexto, rankear, sanear, sanearGrupo,
 } from "./ranking.ts";
+import { extraerBasico } from "./fallback.ts";
 
 const MODELO_EXTRACCION = Deno.env.get("MODEL_EXTRACCION") ?? "claude-haiku-5-5";
 const MODELO_REDACCION = Deno.env.get("MODEL_REDACCION") ?? "claude-sonnet-5-5";
@@ -23,7 +24,17 @@ const CORS = {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { ...CORS, "Content-Type": "application/json" } });
 
-const ETIQUETA_TXT = { segura: "La opción más segura", audaz: "La opción más audaz", sorpresa: "La sorpresa" };
+const ETIQUETA_TXT = {
+  segura: "La opción más segura",
+  audaz: "La opción más audaz",
+  sorpresa: "La sorpresa",
+  alternativa: "Otra buena alternativa",
+};
+
+// Mientras desarrollás, la nota de "modo básico" muestra el motivo. Para ocultarlo: secreto MOSTRAR_DIAGNOSTICO=0
+const MOSTRAR_DIAGNOSTICO = Deno.env.get("MOSTRAR_DIAGNOSTICO") !== "0";
+const limpiarMotivo = (m: string) =>
+  m.replace(/sk-ant-[A-Za-z0-9_-]+/g, "[clave]").replace(/\s+/g, " ").slice(0, 220);
 
 // ---------------------------------------------------------------------
 // Llamada a Claude con salida estructurada (tool use forzado)
@@ -39,17 +50,24 @@ async function claude(opts: { model: string; system: string; user: string; tool:
     body: JSON.stringify({
       model: opts.model,
       max_tokens: opts.max_tokens,
-      system: opts.system,
+      system: `${opts.system}\n\nIMPORTANTE: respondé SIEMPRE llamando a la herramienta "${opts.tool.name}". No escribas texto fuera de la herramienta. Si no pudieras usarla, respondé únicamente con un objeto JSON con la misma estructura que sus parámetros.`,
       messages: [{ role: "user", content: opts.user }],
       tools: [opts.tool],
-      tool_choice: { type: "tool", name: opts.tool.name },
     }),
   });
   if (!r.ok) throw new Error(`Anthropic ${r.status}: ${await r.text()}`);
   const j = await r.json();
-  const bloque = j.content?.find((b: any) => b.type === "tool_use");
-  if (!bloque) throw new Error("La IA no devolvió datos estructurados");
-  return { input: bloque.input, usage: j.usage };
+  const bloque = j.content?.find((b: any) => b.type === "tool_use" && b.name === opts.tool.name)
+    ?? j.content?.find((b: any) => b.type === "tool_use");
+  let input = bloque?.input;
+  if (!input) {
+    // Respaldo: si el modelo contestó con texto, intentar leer un objeto JSON
+    const texto = (j.content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
+    const m = texto.match(/\{[\s\S]*\}/);
+    if (m) { try { input = JSON.parse(m[0]); } catch { /* sigue */ } }
+  }
+  if (!input) throw new Error(`La IA no devolvió datos estructurados (stop_reason=${j.stop_reason})`);
+  return { input, usage: j.usage };
 }
 
 // ---------------------------------------------------------------------
@@ -90,19 +108,30 @@ Deno.serve(async (req) => {
     const grupo: PerfilPersona[] = sanearGrupo(body?.grupo);
     const filtrosPrevios = body?.filtros_previos ? sanear(body.filtros_previos) : null;
 
-    // --- 1) Extracción de filtros (modelo chico) ---
-    const ext = await claude({
-      model: MODELO_EXTRACCION,
-      system: SYSTEM_EXTRACCION,
-      user: JSON.stringify({
-        filtros_previos: filtrosPrevios,
-        tiene_gps: !!ubic,
-        historial: mensajes,
-        instruccion: "Actualizá los filtros según el ÚLTIMO mensaje del usuario.",
-      }),
-      tool: TOOL_EXTRACCION,
-      max_tokens: 700,
-    });
+    // --- 1) Extracción de filtros (modelo chico; si falla, modo básico por reglas) ---
+    let modoBasico = false;
+    let motivoIA = "";
+    let ext: { input: any; usage: unknown };
+    try {
+      if (!Deno.env.get("ANTHROPIC_API_KEY")) throw new Error("Falta el secreto ANTHROPIC_API_KEY");
+      ext = await claude({
+        model: MODELO_EXTRACCION,
+        system: SYSTEM_EXTRACCION,
+        user: JSON.stringify({
+          filtros_previos: filtrosPrevios,
+          tiene_gps: !!ubic,
+          historial: mensajes,
+          instruccion: "Actualizá los filtros según el ÚLTIMO mensaje del usuario.",
+        }),
+        tool: TOOL_EXTRACCION,
+        max_tokens: 2000,
+      });
+    } catch (e) {
+      console.error("IA (extracción) no disponible:", (e as Error).message);
+      modoBasico = true;
+      motivoIA = limpiarMotivo((e as Error).message);
+      ext = { input: extraerBasico(ultimo.texto, filtrosPrevios, !!ubic), usage: null };
+    }
     const filtros: Filtros = sanear(ext.input.filtros);
     const accion: string = ext.input.accion;
 
@@ -200,20 +229,33 @@ Deno.serve(async (req) => {
       puntos_fuertes: e.puntos_fuertes,
       compromisos: e.compromisos,
     }));
-    const red = await claude({
-      model: MODELO_REDACCION,
-      system: SYSTEM_REDACCION,
-      user: JSON.stringify({
-        pedido_usuario: ultimo.texto,
-        filtros,
-        grupo_nombres: grupo.map((p) => p.nombre),
-        alergias_otras: filtros.alergias_otras,
-        relajado,
-        lugares: datosParaIA,
-      }),
-      tool: TOOL_RESPUESTA,
-      max_tokens: 900,
-    });
+    let red: { input: any; usage: unknown };
+    try {
+      if (modoBasico) throw new Error("modo básico");
+      red = await claude({
+        model: MODELO_REDACCION,
+        system: SYSTEM_REDACCION,
+        user: JSON.stringify({
+          pedido_usuario: ultimo.texto,
+          filtros,
+          grupo_nombres: grupo.map((p) => p.nombre),
+          alergias_otras: filtros.alergias_otras,
+          relajado,
+          lugares: datosParaIA,
+        }),
+        tool: TOOL_RESPUESTA,
+        max_tokens: 2500,
+      });
+    } catch (e) {
+      if (!modoBasico) {
+        console.error("IA (redacción) no disponible:", (e as Error).message);
+        motivoIA = limpiarMotivo((e as Error).message);
+      }
+      modoBasico = true;
+      const aviso = relajado.length ? `Como había pocas opciones exactas, ${relajado.join(" y ")}. ` : "";
+      const cuantas = elegidos.length === 1 ? "la opción que mejor encaja" : `las ${elegidos.length} opciones que mejor encajan`;
+      red = { input: { intro: `${aviso}Estas son ${cuantas}:`, items: [] }, usage: null };
+    }
 
     // --- 5) Validación anti-alucinación: solo IDs que elegimos nosotros ---
     const items: Record<string, { porque?: string; compromiso?: string }> = {};
@@ -246,13 +288,14 @@ Deno.serve(async (req) => {
 
     return json({
       texto: String(red.input.intro ?? "Mirá lo que encontré:"),
-      cierre: red.input.cierre ? String(red.input.cierre) : null,
+      cierre: [red.input.cierre ? String(red.input.cierre) : "", modoBasico ? `Nota: estoy en modo básico (sin IA)${MOSTRAR_DIAGNOSTICO && motivoIA ? ` [motivo: ${motivoIA}]` : ""}, por eso la explicación es más simple.` : ""].filter(Boolean).join(" ") || null,
       resultados,
       filtros,
       relajado,
     });
   } catch (e) {
     console.error(e);
-    return json({ error: "Tuve un problema procesando tu pedido. Probá de nuevo en un momento." }, 500);
+    const detalle = (e instanceof Error ? e.message : String(e)).slice(0, 160);
+    return json({ error: `Tuve un problema procesando tu pedido. Detalle técnico: ${detalle}` }, 500);
   }
 });
